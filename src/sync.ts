@@ -277,7 +277,7 @@ export async function runDiagnostics(): Promise<DiagStep[]> {
         steps.push({
           name: "5. Скачивание файла (хост downloader)",
           ok: false,
-          detail: `${e instanceof Error ? e.message : String(e)} — хост не отвечает браузеру`,
+          detail: `fetch не прошёл. Ссылка для проверки в адресной строке: ${href}`,
         });
       }
     } else {

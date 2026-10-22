@@ -6,6 +6,20 @@ import {
   runDiagnostics, type DiagStep,
 } from "../sync";
 
+// Делает URL внутри текста кликабельными
+function renderDetail(text: string) {
+  const parts = text.split(/(https?:\/\/[^\s]+)/g);
+  return parts.map((p, i) =>
+    /^https?:\/\//.test(p) ? (
+      <a key={i} href={p} target="_blank" rel="noreferrer" style={{ color: "var(--accent)" }}>
+        {p}
+      </a>
+    ) : (
+      <span key={i}>{p}</span>
+    )
+  );
+}
+
 export default function SettingsView({ store }: { store: StoreApi }) {
   const [clientId, setCid] = useState(localStorage.getItem("goals101_ya_clientId") ?? "");
   const [msg, setMsg] = useState("");
@@ -57,10 +71,12 @@ export default function SettingsView({ store }: { store: StoreApi }) {
         {diag && (
           <div style={{ marginTop: 10 }}>
             {diag.map((s) => (
-              <div className="day-plan-item" key={s.name}>
-                <span style={{ flex: 1 }}>{s.name}</span>
+              <div className="day-plan-item" key={s.name} style={{ flexWrap: "wrap" }}>
+                <span style={{ flex: 1, minWidth: "50%" }}>{s.name}</span>
                 <span className={`badge ${s.ok ? "done" : "failed"}`}>{s.ok ? "OK" : "ПРОБЛЕМА"}</span>
-                <span className="muted" style={{ fontSize: 12 }}>{s.detail}</span>
+                <span className="muted" style={{ fontSize: 12, wordBreak: "break-all", flexBasis: "100%" }}>
+                  {renderDetail(s.detail)}
+                </span>
               </div>
             ))}
           </div>
