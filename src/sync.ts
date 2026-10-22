@@ -105,18 +105,56 @@ interface ResourceInfo {
   mime_type?: string;
 }
 
+// Каждая выдача /download может попасть на другой хост раздачи.
+// «no more reliable hosts» — ошибка конкретного хоста, поэтому
+// повторяем с НОВОЙ ссылкой (до attempts раз).
+export async function fetchContentWithRetries(
+  attempts = 3
+): Promise<{ text: string | null; lastError: string; hosts: string[] }> {
+  const hosts: string[] = [];
+  let lastError = "";
+  for (let i = 0; i < attempts; i++) {
+    if (i > 0) await new Promise((r) => setTimeout(r, 1000));
+    let href: string;
+    try {
+      const r = await api<{ href: string }>(
+        `/disk/resources/download?path=${encodeURIComponent(DISK_PATH)}`
+      );
+      href = r.href;
+    } catch (e) {
+      // 404 — файла ещё нет, это не ошибка сети
+      if (e instanceof SyncError && e.status === 404) return { text: null, lastError: "файла ещё нет", hosts };
+      throw e;
+    }
+    let host = "";
+    try {
+      host = new URL(href).host;
+    } catch {
+      host = href.slice(0, 60);
+    }
+    hosts.push(host);
+    try {
+      const res = await fetchT(href);
+      if (res.ok) {
+        const text = await res.text();
+        return { text, lastError: "", hosts };
+      }
+      lastError = `HTTP ${res.status} от ${host}`;
+    } catch (e) {
+      lastError = `${e instanceof Error ? e.message : String(e)} (${host})`;
+    }
+  }
+  return { text: null, lastError, hosts };
+}
+
 export async function getDiskFile(): Promise<{ doc: string | null; md5: string | null }> {
   try {
     const info = await api<ResourceInfo>(
       `/disk/resources?path=${encodeURIComponent(DISK_PATH)}&fields=path,md5,size`
     );
-    const downloadUrl = await api<{ href: string }>(
-      `/disk/resources/download?path=${encodeURIComponent(DISK_PATH)}`
-    );
-    const res = await fetchT(downloadUrl.href);
-    if (!res.ok) throw new SyncError(`Скачивание файла: ${res.status}`);
-    const text = await res.text();
-    return { doc: text, md5: info.md5 ?? null };
+    const { text, lastError } = await fetchContentWithRetries(3);
+    if (text !== null) return { doc: text, md5: info.md5 ?? null };
+    throw new SyncError(`Скачивание не удалось: ${lastError}`);
   } catch (e) {
     if (e instanceof SyncError && e.status === 404) return { doc: null, md5: null };
     throw e;
@@ -257,34 +295,24 @@ export async function runDiagnostics(): Promise<DiagStep[]> {
     steps.push({ name: "4. Ссылка на чтение (cloud-api)", ok: false, detail: String(e) });
   }
 
-  // 5. РЕАЛЬНОЕ скачивание содержимого — отдельный хост (downloader)
+  // 5. РЕАЛЬНОЕ скачивание содержимого — с повторами на разные хосты раздачи
   try {
-    const dl = await fetch(
-      url(`/disk/resources/download?path=${encodeURIComponent(DISK_PATH)}`),
-      { headers: { Authorization: `OAuth ${token}` } }
-    );
-    if (dl.ok) {
-      const { href } = (await dl.json()) as { href: string };
-      try {
-        const r = await fetchT(href);
-        const text = r.ok ? await r.text() : "";
-        steps.push({
-          name: "5. Скачивание файла (хост downloader)",
-          ok: r.ok,
-          detail: r.ok ? `прочитано ${text.length} байт` : `HTTP ${r.status}`,
-        });
-      } catch (e) {
-        steps.push({
-          name: "5. Скачивание файла (хост downloader)",
-          ok: false,
-          detail: `fetch не прошёл. Ссылка для проверки в адресной строке: ${href}`,
-        });
-      }
+    const { text, lastError, hosts } = await fetchContentWithRetries(3);
+    if (text !== null) {
+      steps.push({
+        name: "5. Скачивание файла (хосты: " + hosts.join(", ") + ")",
+        ok: true,
+        detail: `прочитано ${text.length} байт`,
+      });
     } else {
-      steps.push({ name: "5. Скачивание файла (хост downloader)", ok: false, detail: `нет ссылки: HTTP ${dl.status}` });
+      steps.push({
+        name: "5. Скачивание файла (хосты: " + hosts.join(", ") + ")",
+        ok: false,
+        detail: `все попытки неудачны: ${lastError}. Последняя ссылка для ручной проверки: https://cloud-api.yandex.net/v1/disk/resources/download?path=${encodeURIComponent(DISK_PATH)}`,
+      });
     }
   } catch (e) {
-    steps.push({ name: "5. Скачивание файла (хост downloader)", ok: false, detail: String(e) });
+    steps.push({ name: "5. Скачивание файла", ok: false, detail: String(e) });
   }
 
   // 6. Тестовая запись в отдельный файл (data.json не трогаем)
