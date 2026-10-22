@@ -1,11 +1,16 @@
 import { useRef, useState } from "react";
 import type { StoreApi } from "../storeApi";
 import { exportDoc, parseImported } from "../db";
-import { getClientId, getToken, logout, setClientId, startOAuth, lastSyncedAt } from "../sync";
+import {
+  getClientId, getToken, logout, setClientId, startOAuth, lastSyncedAt,
+  runDiagnostics, type DiagStep,
+} from "../sync";
 
 export default function SettingsView({ store }: { store: StoreApi }) {
   const [clientId, setCid] = useState(localStorage.getItem("goals101_ya_clientId") ?? "");
   const [msg, setMsg] = useState("");
+  const [diag, setDiag] = useState<DiagStep[] | null>(null);
+  const [diagBusy, setDiagBusy] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
   return (
@@ -33,6 +38,33 @@ export default function SettingsView({ store }: { store: StoreApi }) {
           )}
         </div>
         {lastSyncedAt() && <p className="muted">Последняя синхронизация: {new Date(lastSyncedAt()!).toLocaleString("ru")}</p>}
+
+        <button
+          className="btn secondary"
+          disabled={diagBusy}
+          onClick={async () => {
+            setDiagBusy(true);
+            setDiag(null);
+            try {
+              setDiag(await runDiagnostics());
+            } finally {
+              setDiagBusy(false);
+            }
+          }}
+        >
+          {diagBusy ? "Проверяю…" : "Диагностика синка"}
+        </button>
+        {diag && (
+          <div style={{ marginTop: 10 }}>
+            {diag.map((s) => (
+              <div className="day-plan-item" key={s.name}>
+                <span style={{ flex: 1 }}>{s.name}</span>
+                <span className={`badge ${s.ok ? "done" : "failed"}`}>{s.ok ? "OK" : "ПРОБЛЕМА"}</span>
+                <span className="muted" style={{ fontSize: 12 }}>{s.detail}</span>
+              </div>
+            ))}
+          </div>
+        )}
         <p className="muted" style={{ fontSize: 12 }}>
           Как получить client_id: oauth.yandex.ru → «Зарегистрировать новое приложение» →
           платформы: «Веб-сервисы», Redirect URI: адрес этой страницы → доступы:

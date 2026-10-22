@@ -165,6 +165,89 @@ export function lastSyncedAt(): string | null {
   return localStorage.getItem(LS_SYNCED_AT);
 }
 
+// ---------- диагностика (для телефона: показывает, какой шаг падает) ----------
+
+export interface DiagStep {
+  name: string;
+  ok: boolean;
+  detail: string;
+}
+
+export async function runDiagnostics(): Promise<DiagStep[]> {
+  const steps: DiagStep[] = [];
+  const url = (p: string) => API + p;
+
+  // 1. API доступен вообще (без токена ждём 401 — значит сеть и CORS в порядке)
+  try {
+    const r = await fetch(url("/disk/"));
+    steps.push({
+      name: "1. Сеть до cloud-api.yandex.net",
+      ok: true,
+      detail: `HTTP ${r.status} (401 здесь — норма)`,
+    });
+  } catch (e) {
+    steps.push({
+      name: "1. Сеть до cloud-api.yandex.net",
+      ok: false,
+      detail: `${e instanceof Error ? e.message : String(e)} — нет сети или CORS`,
+    });
+    return steps; // дальше нет смысла
+  }
+
+  // 2. Токен
+  const token = getToken();
+  if (!token) {
+    steps.push({ name: "2. Токен", ok: false, detail: "нет — выполните вход" });
+    return steps;
+  }
+  try {
+    const r = await fetch(url("/disk/"), { headers: { Authorization: `OAuth ${token}` } });
+    if (r.ok) {
+      const j = (await r.json()) as { total_space?: number };
+      steps.push({ name: "2. Токен", ok: true, detail: "действителен" });
+    } else if (r.status === 401) {
+      steps.push({ name: "2. Токен", ok: false, detail: "истёк — нужен повторный вход" });
+      return steps;
+    } else {
+      steps.push({ name: "2. Токен", ok: false, detail: `HTTP ${r.status}` });
+    }
+  } catch (e) {
+    steps.push({ name: "2. Токен", ok: false, detail: String(e) });
+  }
+
+  // 3. Папка/файл данных
+  try {
+    const r = await fetch(
+      url(`/disk/resources?path=${encodeURIComponent(DISK_PATH)}&fields=path,md5`),
+      { headers: { Authorization: `OAuth ${token}` } }
+    );
+    steps.push({
+      name: "3. Файл данных на Диске",
+      ok: r.ok || r.status === 404,
+      detail: r.ok ? "существует" : r.status === 404 ? "ещё не создан (создастся при синке)" : `HTTP ${r.status}`,
+    });
+  } catch (e) {
+    steps.push({ name: "3. Файл данных на Диске", ok: false, detail: String(e) });
+  }
+
+  // 4. Ссылка на скачивание (без записи — только проверка выдачи href)
+  try {
+    const r = await fetch(
+      url(`/disk/resources/download?path=${encodeURIComponent(DISK_PATH)}`),
+      { headers: { Authorization: `OAuth ${token}` } }
+    );
+    steps.push({
+      name: "4. Доступ к чтению файла",
+      ok: r.ok || r.status === 404,
+      detail: r.ok ? "ссылка выдана" : r.status === 404 ? "файла ещё нет" : `HTTP ${r.status}`,
+    });
+  } catch (e) {
+    steps.push({ name: "4. Доступ к чтению файла", ok: false, detail: String(e) });
+  }
+
+  return steps;
+}
+
 // ---------- merge ----------
 
 interface Mergeable {
