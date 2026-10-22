@@ -67,8 +67,19 @@ function authHeaders(): HeadersInit {
 
 // ---------- API ----------
 
+// fetch с таймаутом: на мобильных сетях запросы иногда зависают навсегда
+async function fetchT(url: string, init?: RequestInit, ms = 30000): Promise<Response> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  try {
+    return await fetch(url, { ...init, signal: ctrl.signal });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(API + path, {
+  const res = await fetchT(API + path, {
     ...init,
     headers: { ...authHeaders(), ...(init?.headers ?? {}) },
   });
@@ -102,7 +113,7 @@ export async function getDiskFile(): Promise<{ doc: string | null; md5: string |
     const downloadUrl = await api<{ href: string }>(
       `/disk/resources/download?path=${encodeURIComponent(DISK_PATH)}`
     );
-    const res = await fetch(downloadUrl.href);
+    const res = await fetchT(downloadUrl.href);
     if (!res.ok) throw new SyncError(`Скачивание файла: ${res.status}`);
     const text = await res.text();
     return { doc: text, md5: info.md5 ?? null };
@@ -124,10 +135,11 @@ async function getUploadUrl(overwrite: boolean): Promise<string> {
 async function ensureFolder() {
   const folder = DISK_PATH.slice(0, DISK_PATH.lastIndexOf("/"));
   try {
-    await fetch(API + `/disk/resources/?path=${encodeURIComponent(folder)}`, {
-      method: "PUT",
-      headers: authHeaders(),
-    });
+    await fetchT(
+      API + `/disk/resources/?path=${encodeURIComponent(folder)}`,
+      { method: "PUT", headers: authHeaders() },
+      15000
+    );
   } catch {
     // 409 "уже существует" и прочее — не мешает загрузке
   }
@@ -151,7 +163,7 @@ export async function putDiskFile(text: string, expectedMd5: string | null): Pro
     if (currentMd5 !== expectedMd5) return "conflict";
   }
   const href = await getUploadUrl(true);
-  const res = await fetch(href, { method: "PUT", body: text });
+  const res = await fetchT(href, { method: "PUT", body: text });
   if (!res.ok) throw new SyncError(`Загрузка файла: ${res.status}`);
   return "ok";
 }
@@ -230,19 +242,75 @@ export async function runDiagnostics(): Promise<DiagStep[]> {
     steps.push({ name: "3. Файл данных на Диске", ok: false, detail: String(e) });
   }
 
-  // 4. Ссылка на скачивание (без записи — только проверка выдачи href)
+  // 4. Ссылка на скачивание (JSON отдаётся cloud-api — ок)
   try {
     const r = await fetch(
       url(`/disk/resources/download?path=${encodeURIComponent(DISK_PATH)}`),
       { headers: { Authorization: `OAuth ${token}` } }
     );
     steps.push({
-      name: "4. Доступ к чтению файла",
+      name: "4. Ссылка на чтение (cloud-api)",
       ok: r.ok || r.status === 404,
       detail: r.ok ? "ссылка выдана" : r.status === 404 ? "файла ещё нет" : `HTTP ${r.status}`,
     });
   } catch (e) {
-    steps.push({ name: "4. Доступ к чтению файла", ok: false, detail: String(e) });
+    steps.push({ name: "4. Ссылка на чтение (cloud-api)", ok: false, detail: String(e) });
+  }
+
+  // 5. РЕАЛЬНОЕ скачивание содержимого — отдельный хост (downloader)
+  try {
+    const dl = await fetch(
+      url(`/disk/resources/download?path=${encodeURIComponent(DISK_PATH)}`),
+      { headers: { Authorization: `OAuth ${token}` } }
+    );
+    if (dl.ok) {
+      const { href } = (await dl.json()) as { href: string };
+      try {
+        const r = await fetchT(href);
+        const text = r.ok ? await r.text() : "";
+        steps.push({
+          name: "5. Скачивание файла (хост downloader)",
+          ok: r.ok,
+          detail: r.ok ? `прочитано ${text.length} байт` : `HTTP ${r.status}`,
+        });
+      } catch (e) {
+        steps.push({
+          name: "5. Скачивание файла (хост downloader)",
+          ok: false,
+          detail: `${e instanceof Error ? e.message : String(e)} — хост не отвечает браузеру`,
+        });
+      }
+    } else {
+      steps.push({ name: "5. Скачивание файла (хост downloader)", ok: false, detail: `нет ссылки: HTTP ${dl.status}` });
+    }
+  } catch (e) {
+    steps.push({ name: "5. Скачивание файла (хост downloader)", ok: false, detail: String(e) });
+  }
+
+  // 6. Тестовая запись в отдельный файл (data.json не трогаем)
+  const TEST_PATH = "/101-goals/diag-test.txt";
+  try {
+    const up = await fetch(
+      url(`/disk/resources/upload?path=${encodeURIComponent(TEST_PATH)}&overwrite=true`),
+      { headers: { Authorization: `OAuth ${token}` } }
+    );
+    if (up.ok) {
+      const { href } = (await up.json()) as { href: string };
+      try {
+        const r = await fetchT(href, { method: "PUT", body: "diag" });
+        steps.push({ name: "6. Запись на Диск (хост uploader)", ok: r.ok, detail: `HTTP ${r.status} (diag-test.txt)` });
+      } catch (e) {
+        steps.push({
+          name: "6. Запись на Диск (хост uploader)",
+          ok: false,
+          detail: `${e instanceof Error ? e.message : String(e)} — хост не отвечает браузеру`,
+        });
+      }
+    } else {
+      steps.push({ name: "6. Запись на Диск (хост uploader)", ok: false, detail: `нет ссылки: HTTP ${up.status}` });
+    }
+  } catch (e) {
+    steps.push({ name: "6. Запись на Диск (хост uploader)", ok: false, detail: String(e) });
   }
 
   return steps;
@@ -293,7 +361,7 @@ export function mergeDocs(local: import("./schema").DataDoc, remote: import("./s
 // ---------- сценарий синка ----------
 
 export interface SyncResult {
-  status: "ok" | "conflict" | "error" | "offline" | "no-auth";
+  status: "ok" | "busy" | "conflict" | "error" | "offline" | "no-auth";
   message: string;
 }
 
@@ -309,8 +377,14 @@ export async function sync(
       return await syncOnce(loadLocal, saveLocalDoc);
     } catch (e) {
       const offline = e instanceof TypeError;
+      const aborted = e instanceof DOMException && e.name === "AbortError";
       const last = attempt === 1;
-      if (offline && !last) continue; // повтор через 2 с
+      if ((offline || aborted) && !last) continue; // повтор через 2 с
+      if (aborted)
+        return {
+          status: "offline",
+          message: "Превышено время ожидания (30 с) — данные сохранены локально, попробуйте ещё раз",
+        };
       if (offline)
         return {
           status: "offline",

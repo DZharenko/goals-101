@@ -13,6 +13,7 @@ export function useStore() {
   const [syncState, setSyncState] = useState<SyncResult | null>(null);
   const syncTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const syncingRef = useRef(false);
+  const syncStartRef = useRef(0);
   const rerunRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -45,13 +46,20 @@ export function useStore() {
   }, []);
 
   const doSync = useCallback(async () => {
+    // вачдог: если синк завис более чем на 90 с — принудительно освобождаем
+    if (syncStartRef.current && Date.now() - syncStartRef.current > 90000) {
+      syncingRef.current = false;
+      syncStartRef.current = 0;
+    }
     if (syncingRef.current) {
-      // уже идёт — перепланируем один повтор, чтобы не потерять свежие правки
       if (rerunRef.current) clearTimeout(rerunRef.current);
       rerunRef.current = setTimeout(() => { void doSync(); }, 3000);
-      return { status: "ok", message: "Синк уже идёт" } as SyncResult;
+      setSyncState({ status: "busy", message: "Синхронизация уже идёт — подождите" });
+      return { status: "busy", message: "Синхронизация уже идёт — подождите" } as SyncResult;
     }
     syncingRef.current = true;
+    syncStartRef.current = Date.now();
+    setSyncState({ status: "busy", message: "Синхронизирую…" });
     try {
       const r = await runSync(() => Promise.resolve(docRef), async (d) => {
         docRef = d;
@@ -62,6 +70,7 @@ export function useStore() {
       return r;
     } finally {
       syncingRef.current = false;
+      syncStartRef.current = 0;
     }
   }, []);
 
