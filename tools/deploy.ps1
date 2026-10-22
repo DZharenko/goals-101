@@ -5,6 +5,14 @@
 $ErrorActionPreference = "Stop"
 Set-Location "$PSScriptRoot\.."
 
+# gh-pages: ensure local excludes so git add -A never picks junk
+# (root .gitignore is absent on gh-pages branch)
+$excl = ".git\info\exclude"
+$needed = @("node_modules/", "dist/", "data-*.json", "migration-report.txt", "*.tsbuildinfo", ".deploy-worktree/")
+$content = if (Test-Path $excl) { Get-Content $excl } else { @() }
+foreach ($n in $needed) { if ($content -notcontains $n) { $content += $n } }
+Set-Content -Path $excl -Value $content -Encoding ascii
+
 Write-Host "1/4 Build..." -ForegroundColor Cyan
 npm run build
 if ($LASTEXITCODE -ne 0) { throw "build failed" }
