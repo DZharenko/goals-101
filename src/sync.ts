@@ -1,18 +1,145 @@
-// Синхронизация с Яндекс.Диском через REST API (cloud-api.yandex.net).
-// OAuth implicit flow (без сервера): https://oauth.yandex.ru/authorize?...
-// Протокол: GET data.json -> merge -> HEAD (md5) -> PUT overwrite=true.
+// Синхронизация хранилища данных. Два бэкенда:
+//  - "yandex": REST API Яндекс.Диска (проблема: хост раздачи не даёт CORS на телефонах)
+//  - "github": приватный репозиторий GitHub (API полностью поддерживает CORS)
+// Протокол обоих: GET data.json -> merge -> CAS -> PUT.
 
 import { getDeviceId } from "./db";
 
 const API = "https://cloud-api.yandex.net/v1";
 const DISK_PATH = "/101-goals/data.json";
+const GH_API = "https://api.github.com";
+const GH_PATH = "data.json";
 
 const LS_TOKEN = "goals101_ya_token";
 const LS_CLIENT_ID = "goals101_ya_clientId";
 const LS_MD5 = "goals101_last_md5";
 const LS_SYNCED_AT = "goals101_synced_at";
+const LS_BACKEND = "goals101_backend"; // "yandex" | "github"
+const LS_GH_TOKEN = "goals101_gh_token";
+const LS_GH_REPO = "goals101_gh_repo"; // "owner/repo"
 
-// ---------- токен / OAuth ----------
+// ---------- выбор бэкенда ----------
+
+export type Backend = "yandex" | "github";
+
+export function getBackend(): Backend {
+  return localStorage.getItem(LS_BACKEND) === "github" ? "github" : "yandex";
+}
+
+export function setBackend(b: Backend) {
+  localStorage.setItem(LS_BACKEND, b);
+}
+
+export function ghRepo(): string {
+  const r = localStorage.getItem(LS_GH_REPO);
+  return (r && r.includes("/")) ? r : "DZharenko/goals-data";
+}
+
+export function setGhRepo(repo: string) {
+  localStorage.setItem(LS_GH_REPO, repo.trim().replace(/^https?:\/\/github\.com\//, "").replace(/\.git$/, ""));
+}
+
+export function getGhToken(): string | null {
+  return localStorage.getItem(LS_GH_TOKEN);
+}
+
+export function setGhToken(token: string) {
+  localStorage.setItem(LS_GH_TOKEN, token.trim());
+}
+
+export function ghLogout() {
+  localStorage.removeItem(LS_GH_TOKEN);
+  localStorage.removeItem("goals101_gh_login");
+}
+
+// Логин владельца токена (кэшируется при успешной проверке)
+export function getGhLogin(): string | null {
+  return localStorage.getItem("goals101_gh_login");
+}
+
+// base64 для Unicode-строк
+function b64encode(text: string): string {
+  return btoa(String.fromCharCode(...new TextEncoder().encode(text)));
+}
+function b64decode(b64: string): string {
+  const bin = atob(b64.replace(/\n/g, ""));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
+
+// ---------- GitHub Contents API ----------
+
+function ghHeaders(): HeadersInit {
+  const t = getGhToken();
+  if (!t) throw new SyncError("GitHub-токен не задан (вкладка Синк)", 401);
+  return {
+    Authorization: `Bearer ${t}`,
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
+}
+
+async function ghApi<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetchT(GH_API + path, {
+    ...init,
+    headers: { ...ghHeaders(), ...(init?.headers ?? {}) },
+  });
+  if (res.status === 401) throw new SyncError("GitHub-токен недействителен — создайте новый", 401);
+  if (res.status === 403) throw new SyncError("GitHub: превышен лимит запросов — подождите", 403);
+  if (res.status === 409) throw new SyncError("GitHub: конфликт записи", 409);
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new SyncError(`GitHub: ${res.status} ${body.slice(0, 150)}`, res.status);
+  }
+  return (await res.json()) as T;
+}
+
+interface GhContent {
+  content: string; // base64
+  sha: string;
+  size: number;
+}
+
+async function ghGetFile(): Promise<{ doc: string | null; sha: string | null }> {
+  try {
+    const c = await ghApi<GhContent>(
+      `/repos/${ghRepo()}/contents/${GH_PATH}?t=${Date.now()}`
+    );
+    return { doc: b64decode(c.content), sha: c.sha };
+  } catch (e) {
+    if (e instanceof SyncError && e.status === 404) return { doc: null, sha: null };
+    throw e;
+  }
+}
+
+async function ghPutFile(text: string, expectedSha: string | null): Promise<"ok" | "conflict"> {
+  // текущий sha файла (CAS)
+  let currentSha: string | null = null;
+  try {
+    const c = await ghApi<GhContent>(`/repos/${ghRepo()}/contents/${GH_PATH}?t=${Date.now()}`);
+    currentSha = c.sha;
+  } catch (e) {
+    if (!(e instanceof SyncError && e.status === 404)) throw e;
+  }
+  if (currentSha !== expectedSha) return "conflict";
+  const res = await fetchT(GH_API + `/repos/${ghRepo()}/contents/${GH_PATH}`, {
+    method: "PUT",
+    headers: ghHeaders(),
+    body: JSON.stringify({
+      message: `sync ${new Date().toISOString()}`,
+      content: b64encode(text),
+      ...(expectedSha ? { sha: expectedSha } : {}),
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new SyncError(`GitHub запись: ${res.status} ${body.slice(0, 150)}`, res.status);
+  }
+  return "ok";
+}
+
+// ---------- токен / OAuth (Яндекс) ----------
 
 export function getToken(): string | null {
   return localStorage.getItem(LS_TOKEN);
@@ -226,6 +353,53 @@ export interface DiagStep {
 }
 
 export async function runDiagnostics(): Promise<DiagStep[]> {
+  if (getBackend() === "github") return runGhDiagnostics();
+  return runYaDiagnostics();
+}
+
+async function runGhDiagnostics(): Promise<DiagStep[]> {
+  const steps: DiagStep[] = [];
+  // 1. сеть до api.github.com
+  try {
+    const r = await fetchT(`${GH_API}/zen`, undefined, 15000);
+    steps.push({ name: "1. Сеть до api.github.com", ok: true, detail: `HTTP ${r.status}` });
+  } catch (e) {
+    steps.push({ name: "1. Сеть до api.github.com", ok: false, detail: `${String(e)} — нет сети` });
+    return steps;
+  }
+  // 2. токен
+  const token = getGhToken();
+  if (!token) {
+    steps.push({ name: "2. Токен GitHub", ok: false, detail: "не задан — вставьте в настройках" });
+    return steps;
+  }
+  try {
+    const user = await ghApi<{ login: string }>("/user");
+    localStorage.setItem("goals101_gh_login", user.login);
+    steps.push({ name: "2. Токен GitHub", ok: true, detail: `владелец: ${user.login}` });
+  } catch (e) {
+    steps.push({ name: "2. Токен GitHub", ok: false, detail: String(e instanceof Error ? e.message : e) });
+    return steps;
+  }
+  // 3. репозиторий и файл
+  try {
+    const f = await ghGetFile();
+    steps.push({
+      name: `3. Репозиторий ${ghRepo()}`,
+      ok: true,
+      detail: f.doc ? `data.json прочитан (${f.doc.length} байт)` : "файла ещё нет — создастся при первом синке",
+    });
+  } catch (e) {
+    steps.push({
+      name: `3. Репозиторий ${ghRepo()}`,
+      ok: false,
+      detail: `${String(e instanceof Error ? e.message : e)} — проверьте имя репозитория и права токена (Contents: read/write)`,
+    });
+  }
+  return steps;
+}
+
+async function runYaDiagnostics(): Promise<DiagStep[]> {
   const steps: DiagStep[] = [];
   const url = (p: string) => API + p;
 
@@ -399,7 +573,11 @@ export async function sync(
   loadLocal: () => Promise<import("./schema").DataDoc>,
   saveLocalDoc: (d: import("./schema").DataDoc) => Promise<void>
 ): Promise<SyncResult> {
-  if (!getToken()) return { status: "no-auth", message: "Нет токена — выполните вход в Яндекс" };
+  const backend = getBackend();
+  if (backend === "github" && !getGhToken())
+    return { status: "no-auth", message: "GitHub-токен не задан (вкладка Синк)" };
+  if (backend === "yandex" && !getToken())
+    return { status: "no-auth", message: "Нет токена — выполните вход в Яндекс" };
   // до 2 попыток: разовые сетевые сбои лечатся коротким повтором
   for (let attempt = 0; attempt < 2; attempt++) {
     if (attempt > 0) await new Promise((r) => setTimeout(r, 2000));
@@ -420,6 +598,10 @@ export async function sync(
           status: "offline",
           message: "Нет сети — данные сохранены локально, синк повторится",
         };
+      if (e instanceof SyncError && e.status === 401) {
+        if (backend === "github") localStorage.removeItem(LS_GH_TOKEN);
+        return { status: "no-auth", message: e.message };
+      }
       return { status: "error", message: e instanceof Error ? e.message : String(e) };
     }
   }
@@ -430,10 +612,22 @@ async function syncOnce(
   loadLocal: () => Promise<import("./schema").DataDoc>,
   saveLocalDoc: (d: import("./schema").DataDoc) => Promise<void>
 ): Promise<SyncResult> {
+  const backend = getBackend();
+  const readRemote = async (): Promise<{ doc: string | null; version: string | null }> => {
+    if (backend === "github") {
+      const r = await ghGetFile();
+      return { doc: r.doc, version: r.sha };
+    }
+    const r = await getDiskFile();
+    return { doc: r.doc, version: r.md5 };
+  };
+  const writeRemote = (text: string, version: string | null) =>
+    backend === "github" ? ghPutFile(text, version) : putDiskFile(text, version);
+
   const local = await loadLocal();
-  const remote = await getDiskFile();
+  const remote = await readRemote();
   let merged = local;
-  let remoteMd5 = remote.md5;
+  let remoteVersion = remote.version;
   if (remote.doc) {
     const remoteDoc = JSON.parse(remote.doc) as import("./schema").DataDoc;
     merged = mergeDocs(local, remoteDoc);
@@ -441,16 +635,16 @@ async function syncOnce(
   await saveLocalDoc(merged);
   // Пытаемся записать; при конфликте — перечитываем и мерджим ещё раз (1 ретрай)
   for (let attempt = 0; attempt < 2; attempt++) {
-    const result = await putDiskFile(JSON.stringify(merged), remoteMd5);
+    const result = await writeRemote(JSON.stringify(merged), remoteVersion);
     if (result === "ok") {
-      rememberMd5(await headMd5());
+      if (backend === "yandex") rememberMd5(await headMd5());
       localStorage.setItem(LS_SYNCED_AT, new Date().toISOString());
       return { status: "ok", message: "Синхронизировано" };
     }
     // конфликт: перечитать, смёрджить, повторить
-    const again = await getDiskFile();
+    const again = await readRemote();
     if (again.doc) merged = mergeDocs(merged, JSON.parse(again.doc));
-    remoteMd5 = again.md5;
+    remoteVersion = again.version;
     await saveLocalDoc(merged);
   }
   return { status: "conflict", message: "Конфликт не разрешился — попробуйте ещё раз" };
