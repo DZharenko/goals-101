@@ -110,9 +110,10 @@ interface ResourceInfo {
 // повторяем с НОВОЙ ссылкой (до attempts раз).
 export async function fetchContentWithRetries(
   attempts = 3
-): Promise<{ text: string | null; lastError: string; hosts: string[] }> {
+): Promise<{ text: string | null; lastError: string; hosts: string[]; lastHref: string }> {
   const hosts: string[] = [];
   let lastError = "";
+  let lastHref = "";
   for (let i = 0; i < attempts; i++) {
     if (i > 0) await new Promise((r) => setTimeout(r, 1000));
     let href: string;
@@ -123,9 +124,10 @@ export async function fetchContentWithRetries(
       href = r.href;
     } catch (e) {
       // 404 — файла ещё нет, это не ошибка сети
-      if (e instanceof SyncError && e.status === 404) return { text: null, lastError: "файла ещё нет", hosts };
+      if (e instanceof SyncError && e.status === 404) return { text: null, lastError: "файла ещё нет", hosts, lastHref };
       throw e;
     }
+    lastHref = href;
     let host = "";
     try {
       host = new URL(href).host;
@@ -137,14 +139,14 @@ export async function fetchContentWithRetries(
       const res = await fetchT(href);
       if (res.ok) {
         const text = await res.text();
-        return { text, lastError: "", hosts };
+        return { text, lastError: "", hosts, lastHref };
       }
       lastError = `HTTP ${res.status} от ${host}`;
     } catch (e) {
       lastError = `${e instanceof Error ? e.message : String(e)} (${host})`;
     }
   }
-  return { text: null, lastError, hosts };
+  return { text: null, lastError, hosts, lastHref };
 }
 
 export async function getDiskFile(): Promise<{ doc: string | null; md5: string | null }> {
@@ -154,7 +156,7 @@ export async function getDiskFile(): Promise<{ doc: string | null; md5: string |
     );
     const { text, lastError } = await fetchContentWithRetries(3);
     if (text !== null) return { doc: text, md5: info.md5 ?? null };
-    throw new SyncError(`Скачивание не удалось: ${lastError}`);
+    throw new SyncError(`Скачивание не удалось: ${lastError}`, 502);
   } catch (e) {
     if (e instanceof SyncError && e.status === 404) return { doc: null, md5: null };
     throw e;
@@ -297,7 +299,7 @@ export async function runDiagnostics(): Promise<DiagStep[]> {
 
   // 5. РЕАЛЬНОЕ скачивание содержимого — с повторами на разные хосты раздачи
   try {
-    const { text, lastError, hosts } = await fetchContentWithRetries(3);
+    const { text, lastError, hosts, lastHref } = await fetchContentWithRetries(3);
     if (text !== null) {
       steps.push({
         name: "5. Скачивание файла (хосты: " + hosts.join(", ") + ")",
@@ -308,7 +310,7 @@ export async function runDiagnostics(): Promise<DiagStep[]> {
       steps.push({
         name: "5. Скачивание файла (хосты: " + hosts.join(", ") + ")",
         ok: false,
-        detail: `все попытки неудачны: ${lastError}. Последняя ссылка для ручной проверки: https://cloud-api.yandex.net/v1/disk/resources/download?path=${encodeURIComponent(DISK_PATH)}`,
+        detail: `все попытки неудачны: ${lastError}. Проверка вручную — открыть в браузере: ${lastHref}`,
       });
     }
   } catch (e) {
